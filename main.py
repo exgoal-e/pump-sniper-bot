@@ -2,9 +2,11 @@ import requests
 import pandas as pd
 import numpy as np
 import time
+import os
 
-TOKEN = "TELEGRAM_BOT_TOKEN"
-CHAT_ID = "CHAT_ID"
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
 
 sent_cache = {}
 
