@@ -7,8 +7,8 @@ import os
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-
 sent_cache = {}
+trade_log = []
 
 # ================= TELEGRAM =================
 def send_telegram(msg):
@@ -28,11 +28,8 @@ def get_klines(symbol, interval="5m", limit=120):
     df = pd.DataFrame(data)
     df.columns = ["time","o","h","l","c","v","_","_","_","_","_","_"]
 
-    df["o"] = df["o"].astype(float)
-    df["h"] = df["h"].astype(float)
-    df["l"] = df["l"].astype(float)
-    df["c"] = df["c"].astype(float)
-    df["v"] = df["v"].astype(float)
+    for col in ["o","h","l","c","v"]:
+        df[col] = df[col].astype(float)
 
     return df
 
@@ -52,31 +49,25 @@ def rsi(df, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ================= SMART MONEY (YENİ) =================
+# ================= SMART MONEY =================
 def smart_money(df):
-    # hacim artışı + mum gücü
     vol = df["v"].iloc[-1]
     vol_prev = df["v"].iloc[-2]
 
     body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
     spread = df["h"].iloc[-1] - df["l"].iloc[-1]
 
-    strong_candle = body > spread * 0.6
-    vol_increase = vol > vol_prev * 1.3
+    strong = body > spread * 0.6
+    vol_up = vol > vol_prev * 1.3
 
-    return strong_candle and vol_increase
+    return strong and vol_up
 
-# ================= ERKEN SİNYAL (YENİ) =================
+# ================= EARLY =================
 def early_breakout(df):
     highest = df["h"].rolling(20).max()
-
-    # klasik breakout değil → yaklaşma
-    near_break = df["c"].iloc[-1] > highest.iloc[-2] * 0.995
-
-    # momentum artıyor mu?
-    momentum_build = df["c"].iloc[-1] > df["c"].iloc[-2]
-
-    return near_break and momentum_build
+    near = df["c"].iloc[-1] > highest.iloc[-2] * 0.995
+    momentum = df["c"].iloc[-1] > df["c"].iloc[-2]
+    return near and momentum
 
 # ================= ANALYZE =================
 def analyze(symbol):
@@ -88,7 +79,6 @@ def analyze(symbol):
     df["hist"] = macd(df)
     df["rsi"] = rsi(df)
 
-    # ===== BASE (DEĞİŞMEDİ) =====
     volSpike = df["v"].iloc[-1] > df["vol_avg"].iloc[-1] * 2
 
     highest = df["h"].rolling(20).max()
@@ -115,71 +105,124 @@ def analyze(symbol):
     htfBull = df1h["c"].iloc[-1] > ma1h.iloc[-1]
     htfBear = df1h["c"].iloc[-1] < ma1h.iloc[-1]
 
-    # ===== YENİ GÜÇLENDİRME =====
     smart = smart_money(df)
     early = early_breakout(df)
 
-    # ===== FINAL =====
-    longSignal = (
-        volSpike and
-        (breakout or early) and
-        trendUp and
-        macdBull and
-        rsiLong and
-        noFake and
-        htfBull and
-        smart
-    )
+    # SCORE
+    score = 0
+    if volSpike: score += 20
+    if breakout or breakdown: score += 20
+    if early: score += 10
+    if smart: score += 20
+    if macdBull or macdBear: score += 15
+    if htfBull or htfBear: score += 15
 
-    shortSignal = (
-        volSpike and
-        (breakdown) and
-        trendDown and
-        macdBear and
-        rsiShort and
-        noFake and
-        htfBear and
-        smart
-    )
+    price = df["c"].iloc[-1]
+
+    # ===== EARLY =====
+    if early and not breakout and trendUp and smart:
+        msg = f"""
+🟡 EARLY SETUP
+
+Coin: {symbol}
+Entry: {price:.6f}
+
+Hazırlık aşaması ⚠️
+Breakout gelirse pump başlar
+
+Score: {score}/100
+"""
+        return {"symbol": symbol, "score": score-5, "msg": msg}
+
+    # ===== SNIPER =====
+    longSignal = all([volSpike, breakout, trendUp, macdBull, rsiLong, noFake, htfBull, smart])
+    shortSignal = all([volSpike, breakdown, trendDown, macdBear, rsiShort, noFake, htfBear, smart])
 
     if longSignal or shortSignal:
-        price = df["c"].iloc[-1]
 
         if longSignal:
-            sl = price * 0.99
-            tp = price * 1.025
             direction = "🚀 LONG"
+            sl = price * 0.99
+            tp1 = price * 1.01
+            tp2 = price * 1.03
         else:
-            sl = price * 1.01
-            tp = price * 0.975
             direction = "🔻 SHORT"
+            sl = price * 1.01
+            tp1 = price * 0.99
+            tp2 = price * 0.97
 
-        # SCORE (upgrade)
-        score = 0
-        if volSpike: score += 20
-        if breakout: score += 20
-        if early: score += 10
-        if macdBull or macdBear: score += 15
-        if smart: score += 20
-        if htfBull or htfBear: score += 15
+        # ETA
+        if score >= 80:
+            eta = "5-15 min"
+            speed = "FAST"
+        elif score >= 60:
+            eta = "15-45 min"
+            speed = "MEDIUM"
+        else:
+            eta = "30-90 min"
+            speed = "SLOW"
 
-        return {
-            "symbol": symbol,
-            "score": score,
-            "msg": f"""
+        # momentum
+        if smart and volSpike:
+            momentum = "STRONG"
+        elif macdBull or macdBear:
+            momentum = "NORMAL"
+        else:
+            momentum = "WEAK"
+
+        msg = f"""
 {direction} SNIPER
 
 Coin: {symbol}
-Fiyat: {price:.6f}
+Entry: {price:.6f}
+
+TP1: {tp1:.6f}
+TP2: {tp2:.6f}
 
 SL: {sl:.6f}
-TP: {tp:.6f}
+
+ETA: {eta}
+Type: {speed}
+Momentum: {momentum}
 
 Score: {score}/100
-            """
-        }
+"""
+
+        # trade log (winrate için)
+        trade_log.append({
+            "symbol": symbol,
+            "entry": price,
+            "tp1": tp1,
+            "tp2": tp2,
+            "sl": sl,
+            "time": time.time()
+        })
+
+        return {"symbol": symbol, "score": score, "msg": msg}
 
     return None
+
+# ================= WINRATE =================
+def check_results():
+    global trade_log
+    new_log = []
+
+    for t in trade_log:
+        try:
+            df = get_klines(t["symbol"])
+            high = df["h"].iloc[-1]
+            low = df["l"].iloc[-1]
+
+            if high >= t["tp1"]:
+                print(f"WIN TP1: {t['symbol']}")
+            elif low <= t["sl"]:
+                print(f"LOSS: {t['symbol']}")
+            else:
+                new_log.append(t)
+        except:
+            new_log.append(t)
+
+    trade_log = new_log
 
 # ================= MAIN =================
 def run():
@@ -206,6 +249,8 @@ def run():
 
         send_telegram(s["msg"])
         sent_cache[sym] = time.time()
+
+    check_results()
 
 # LOOP
 while True:
