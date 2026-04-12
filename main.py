@@ -1,258 +1,280 @@
-import requests
+from binance.client import Client
 import pandas as pd
-import numpy as np
-import time
-import os
+import time, os, requests
+from datetime import datetime
+
+# ========= CONFIG =========
+MODE = "PAPER"   # PAPER / LIVE
+
+CONFIG = {
+    "RISK": 0.01,
+    "vol_mult": 2.0,
+    "tp1": 0.01,
+    "tp2": 0.02,
+    "trail": 0.01
+}
+
+MAX_POS = 3
+DAILY_LOSS_LIMIT = -0.03
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+API_KEY = os.getenv("BINANCE_KEY")
+API_SECRET = os.getenv("BINANCE_SECRET")
 
-sent_cache = {}
-trade_log = []
+client = Client(API_KEY, API_SECRET)
 
-# ================= TELEGRAM =================
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+positions = {}
+daily_pnl = 0
+pattern_db = {}
+trade_count = 0
 
-# ================= DATA =================
+# ========= TELEGRAM =========
+def send(msg):
+    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  json={"chat_id": CHAT_ID, "text": msg})
+
+# ========= DATA =========
 def get_symbols():
-    url = "https://api.binance.com/api/v3/exchangeInfo"
-    data = requests.get(url).json()
-    return [s['symbol'] for s in data['symbols'] if s['quoteAsset'] == 'USDT']
+    info = client.futures_exchange_info()
+    return [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT']
 
-def get_klines(symbol, interval="5m", limit=120):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = requests.get(url).json()
-
-    df = pd.DataFrame(data)
-    df.columns = ["time","o","h","l","c","v","_","_","_","_","_","_"]
-
-    for col in ["o","h","l","c","v"]:
-        df[col] = df[col].astype(float)
-
+def get_klines(symbol):
+    k = client.futures_klines(symbol=symbol, interval="5m", limit=100)
+    df = pd.DataFrame(k)
+    df.columns = ["t","o","h","l","c","v","_","_","_","_","_","_"]
+    df[["o","h","l","c","v"]] = df[["o","h","l","c","v"]].astype(float)
     return df
 
-# ================= INDICATORS =================
-def macd(df):
-    exp1 = df["c"].ewm(span=12).mean()
-    exp2 = df["c"].ewm(span=26).mean()
-    macd_line = exp1 - exp2
-    signal = macd_line.ewm(span=9).mean()
-    hist = macd_line - signal
-    return hist
-
-def rsi(df, period=14):
-    delta = df["c"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-# ================= SMART MONEY =================
-def smart_money(df):
+# ========= SCORE =========
+def score(df):
     vol = df["v"].iloc[-1]
-    vol_prev = df["v"].iloc[-2]
+    vol_avg = df["v"].rolling(20).mean().iloc[-1]
+    momentum = df["c"].iloc[-1] - df["c"].iloc[-2]
 
-    body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
-    spread = df["h"].iloc[-1] - df["l"].iloc[-1]
+    s = 0
+    if vol > vol_avg * CONFIG["vol_mult"]: s += 2
+    if momentum > 0: s += 1
+    if df["c"].iloc[-1] > df["c"].rolling(50).mean().iloc[-1]: s += 1
 
-    strong = body > spread * 0.6
-    vol_up = vol > vol_prev * 1.3
+    return s, vol > vol_avg, momentum > 0
 
-    return strong and vol_up
-
-# ================= EARLY =================
-def early_breakout(df):
-    highest = df["h"].rolling(20).max()
-    near = df["c"].iloc[-1] > highest.iloc[-2] * 0.995
-    momentum = df["c"].iloc[-1] > df["c"].iloc[-2]
-    return near and momentum
-
-# ================= ANALYZE =================
+# ========= ANALYZE =========
 def analyze(symbol):
     df = get_klines(symbol)
-    df1h = get_klines(symbol, "1h")
+    s, volSpike, momentum = score(df)
 
-    df["ma"] = df["c"].rolling(50).mean()
-    df["vol_avg"] = df["v"].rolling(20).mean()
-    df["hist"] = macd(df)
-    df["rsi"] = rsi(df)
+    if s < 3:
+        return None
 
-    volSpike = df["v"].iloc[-1] > df["vol_avg"].iloc[-1] * 2
+    trendUp = df["c"].iloc[-1] > df["c"].rolling(50).mean().iloc[-1]
+    key = f"{volSpike}_{momentum}_{trendUp}"
 
-    highest = df["h"].rolling(20).max()
-    lowest = df["l"].rolling(20).min()
+    if key in pattern_db and pattern_db[key]["trades"] > 5:
+        winrate = pattern_db[key]["win"] / pattern_db[key]["trades"]
+        if winrate < 0.4:
+            return None
 
-    breakout = df["c"].iloc[-1] > highest.iloc[-2]
-    breakdown = df["c"].iloc[-1] < lowest.iloc[-2]
+    return ("LONG" if trendUp else "SHORT"), s, key
 
-    trendUp = df["c"].iloc[-1] > df["ma"].iloc[-1]
-    trendDown = df["c"].iloc[-1] < df["ma"].iloc[-1]
+# ========= BALANCE =========
+def get_balance():
+    if MODE == "PAPER":
+        return 1000
+    b = client.futures_account_balance()
+    for x in b:
+        if x["asset"] == "USDT":
+            return float(x["balance"])
 
-    macdBull = df["hist"].iloc[-1] > df["hist"].iloc[-2] and df["hist"].iloc[-1] > 0
-    macdBear = df["hist"].iloc[-1] < df["hist"].iloc[-2] and df["hist"].iloc[-1] < 0
+# ========= SIZE =========
+def calc_qty(price):
+    bal = get_balance()
+    risk_amt = bal * CONFIG["RISK"]
+    sl = price * 0.01
+    return round(risk_amt / sl, 3)
 
-    rsiLong = df["rsi"].iloc[-1] < 70
-    rsiShort = df["rsi"].iloc[-1] > 30
+# ========= OPEN =========
+def open_trade(symbol, side, score_val, key):
+    df = get_klines(symbol)
+    price = df["c"].iloc[-1]
+    qty = calc_qty(price)
 
-    body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
-    wick = df["h"].iloc[-1] - max(df["o"].iloc[-1], df["c"].iloc[-1])
-    noFake = body > wick * 0.7
+    if MODE == "LIVE":
+        order_side = "BUY" if side=="LONG" else "SELL"
+        client.futures_create_order(symbol=symbol, side=order_side,
+                                    type="MARKET", quantity=qty)
 
-    # HTF
-    ma1h = df1h["c"].rolling(50).mean()
-    htfBull = df1h["c"].iloc[-1] > ma1h.iloc[-1]
-    htfBear = df1h["c"].iloc[-1] < ma1h.iloc[-1]
+    positions[symbol] = {
+        "side": side,
+        "entry": price,
+        "qty": qty,
+        "tp1": False,
+        "added": False,
+        "peak": price,
+        "pattern": key
+    }
 
-    smart = smart_money(df)
-    early = early_breakout(df)
+    send(f"""
+🚀 {side} {symbol}
 
-    # SCORE
-    score = 0
-    if volSpike: score += 20
-    if breakout or breakdown: score += 20
-    if early: score += 10
-    if smart: score += 20
-    if macdBull or macdBear: score += 15
-    if htfBull or htfBear: score += 15
+Entry: {round(price,5)}
+Score: {score_val}
 
+TP1: {round(price*(1+CONFIG["tp1"]),5)}
+TP2: {round(price*(1+CONFIG["tp2"]),5)}
+
+Trailing: ON
+📊 https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}
+""")
+
+# ========= CLOSE =========
+def close(symbol, price):
+    global daily_pnl, trade_count
+
+    pos = positions[symbol]
+    entry = pos["entry"]
+
+    pnl = (price-entry)/entry if pos["side"]=="LONG" else (entry-price)/entry
+    daily_pnl += pnl
+    trade_count += 1
+
+    key = pos["pattern"]
+    if key not in pattern_db:
+        pattern_db[key] = {"win":0,"loss":0,"trades":0}
+
+    if pnl > 0:
+        pattern_db[key]["win"] += 1
+    else:
+        pattern_db[key]["loss"] += 1
+
+    pattern_db[key]["trades"] += 1
+
+    if MODE == "LIVE":
+        side = "SELL" if pos["side"]=="LONG" else "BUY"
+        client.futures_create_order(symbol=symbol, side=side,
+                                    type="MARKET", quantity=pos["qty"])
+
+    send(f"""
+❌ CLOSE {symbol}
+
+PnL: %{round(pnl*100,2)}
+Günlük: %{round(daily_pnl*100,2)}
+""")
+
+    del positions[symbol]
+
+# ========= MANAGE =========
+def manage(symbol):
+    pos = positions[symbol]
+    df = get_klines(symbol)
     price = df["c"].iloc[-1]
 
-    # ===== EARLY =====
-    if early and not breakout and trendUp and smart:
-        msg = f"""
-🟡 EARLY SETUP
+    entry = pos["entry"]
+    side = pos["side"]
 
-Coin: {symbol}
-Entry: {price:.6f}
+    pnl = (price-entry)/entry if side=="LONG" else (entry-price)/entry
 
-Hazırlık aşaması ⚠️
-Breakout gelirse pump başlar
+    # peak
+    if side=="LONG" and price > pos["peak"]:
+        pos["peak"] = price
+    elif side=="SHORT" and price < pos["peak"]:
+        pos["peak"] = price
 
-Score: {score}/100
-"""
-        return {"symbol": symbol, "score": score-5, "msg": msg}
+    # scale-in
+    if not pos["added"] and pnl < -0.005:
+        pos["added"] = True
+        send(f"📥 SCALE-IN {symbol}")
 
-    # ===== SNIPER =====
-    longSignal = all([volSpike, breakout, trendUp, macdBull, rsiLong, noFake, htfBull, smart])
-    shortSignal = all([volSpike, breakdown, trendDown, macdBear, rsiShort, noFake, htfBear, smart])
+    # TP1
+    if not pos["tp1"] and pnl > CONFIG["tp1"]:
+        pos["tp1"] = True
+        send(f"💰 TP1 {symbol} %{round(pnl*100,2)}")
 
-    if longSignal or shortSignal:
+    # trailing
+    if side=="LONG":
+        if price < pos["peak"] * (1-CONFIG["trail"]):
+            send(f"❌ TRAILING EXIT {symbol}")
+            close(symbol, price)
+    else:
+        if price > pos["peak"] * (1+CONFIG["trail"]):
+            send(f"❌ TRAILING EXIT {symbol}")
+            close(symbol, price)
 
-        if longSignal:
-            direction = "🚀 LONG"
-            sl = price * 0.99
-            tp1 = price * 1.01
-            tp2 = price * 1.03
-        else:
-            direction = "🔻 SHORT"
-            sl = price * 1.01
-            tp1 = price * 0.99
-            tp2 = price * 0.97
+# ========= AI OPTIMIZER =========
+def optimize():
+    if trade_count < 20:
+        return
 
-        # ETA
-        if score >= 80:
-            eta = "5-15 min"
-            speed = "FAST"
-        elif score >= 60:
-            eta = "15-45 min"
-            speed = "MEDIUM"
-        else:
-            eta = "30-90 min"
-            speed = "SLOW"
+    wins = sum(v["win"] for v in pattern_db.values())
+    total = sum(v["trades"] for v in pattern_db.values())
 
-        # momentum
-        if smart and volSpike:
-            momentum = "STRONG"
-        elif macdBull or macdBear:
-            momentum = "NORMAL"
-        else:
-            momentum = "WEAK"
+    if total == 0:
+        return
 
-        msg = f"""
-{direction} SNIPER
+    winrate = wins / total
 
-Coin: {symbol}
-Entry: {price:.6f}
+    msg = f"\n🧠 AI OPTIMIZATION\nWinrate: %{round(winrate*100,2)}\n"
 
-TP1: {tp1:.6f}
-TP2: {tp2:.6f}
+    if winrate < 0.5:
+        CONFIG["vol_mult"] += 0.2
+        CONFIG["tp1"] -= 0.002
+        CONFIG["trail"] -= 0.001
+        msg += "❌ Daha sıkı filtre\n"
 
-SL: {sl:.6f}
+    elif winrate > 0.65:
+        CONFIG["vol_mult"] -= 0.1
+        CONFIG["tp1"] += 0.002
+        CONFIG["trail"] += 0.001
+        msg += "🔥 Daha agresif\n"
 
-ETA: {eta}
-Type: {speed}
-Momentum: {momentum}
-
-Score: {score}/100
+    msg += f"""
+Vol: {CONFIG["vol_mult"]}
+TP1: {CONFIG["tp1"]}
+Trail: {CONFIG["trail"]}
 """
 
-        # trade log (winrate için)
-        trade_log.append({
-            "symbol": symbol,
-            "entry": price,
-            "tp1": tp1,
-            "tp2": tp2,
-            "sl": sl,
-            "time": time.time()
-        })
+    send(msg)
 
-        return {"symbol": symbol, "score": score, "msg": msg}
+# ========= FILTER =========
+def allowed_hour():
+    return datetime.now().hour not in [3,4]
 
-    return None
+# ========= KILL SWITCH =========
+def kill_switch():
+    if daily_pnl <= DAILY_LOSS_LIMIT:
+        send("🛑 BOT DURDU")
+        return True
+    return False
 
-# ================= WINRATE =================
-def check_results():
-    global trade_log
-    new_log = []
-
-    for t in trade_log:
-        try:
-            df = get_klines(t["symbol"])
-            high = df["h"].iloc[-1]
-            low = df["l"].iloc[-1]
-
-            if high >= t["tp1"]:
-                print(f"WIN TP1: {t['symbol']}")
-            elif low <= t["sl"]:
-                print(f"LOSS: {t['symbol']}")
-            else:
-                new_log.append(t)
-        except:
-            new_log.append(t)
-
-    trade_log = new_log
-
-# ================= MAIN =================
+# ========= MAIN =========
 def run():
-    symbols = get_symbols()
-    signals = []
+    if kill_switch():
+        return
+
+    symbols = get_symbols()[:200]
 
     for sym in symbols:
         try:
-            res = analyze(sym)
-            if res:
-                signals.append(res)
-            time.sleep(0.08)
+            if not allowed_hour():
+                continue
+
+            result = analyze(sym)
+            if not result:
+                continue
+
+            signal, s, key = result
+
+            if sym not in positions:
+                open_trade(sym, signal, s, key)
+
+            if sym in positions:
+                manage(sym)
+
         except:
             continue
 
-    # en iyi 3
-    signals = sorted(signals, key=lambda x: x["score"], reverse=True)[:3]
+    optimize()
 
-    for s in signals:
-        sym = s["symbol"]
-
-        if sym in sent_cache and time.time() - sent_cache[sym] < 1800:
-            continue
-
-        send_telegram(s["msg"])
-        sent_cache[sym] = time.time()
-
-    check_results()
-
-# LOOP
 while True:
     run()
     time.sleep(60)
