@@ -1,3 +1,4 @@
+python-binance
 requests
 pandas
 numpy
