@@ -1,7 +1,10 @@
+# ========= IMPORT =========
 from binance.client import Client
 import pandas as pd
+import numpy as np
 import time, os, requests
 from datetime import datetime
+from sklearn.ensemble import RandomForestClassifier
 
 # ========= CONFIG =========
 CONFIG = {
@@ -9,8 +12,11 @@ CONFIG = {
     "RR": 2,
     "trail": 0.01,
     "vol_mult": 2,
-    "whale_size": 10000
+    "max_positions": 3,
+    "daily_dd": -0.03
 }
+
+LIVE = False  # 🔴 TRUE yapınca gerçek trade açar
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -21,15 +27,22 @@ client = Client(API_KEY, API_SECRET)
 
 positions = {}
 trade_history = []
-trade_log = []
+daily_pnl = 0
 
-coin_stats = {}
-hour_stats = {}
+# ========= ML MODEL =========
+model = RandomForestClassifier(n_estimators=50)
 
-scan_count = 0
-signal_count = 0
-trade_count = 0
-last_report_day = None
+X_data = []
+y_data = []
+
+def train_model():
+    if len(X_data) > 50:
+        model.fit(X_data, y_data)
+
+def predict(features):
+    if len(X_data) < 50:
+        return 0.5
+    return model.predict_proba([features])[0][1]
 
 # ========= TELEGRAM =========
 def send(msg):
@@ -47,252 +60,132 @@ def klines(sym, tf):
 def symbols():
     return [s['symbol'] for s in client.futures_exchange_info()['symbols'] if s['quoteAsset']=="USDT"]
 
-# ========= ORDERBOOK =========
-def orderbook(sym):
-    ob = client.futures_order_book(symbol=sym, limit=50)
-    bids = sum(float(x[1]) for x in ob["bids"])
-    asks = sum(float(x[1]) for x in ob["asks"])
-    return bids/asks if asks else 1, ob
+# ========= ORDER =========
+def open_order(sym, side, qty):
+    if not LIVE:
+        return
 
-# ========= WHALE =========
-def whale(ob):
-    big_bids = sum(float(x[1]) for x in ob["bids"] if float(x[1]) > CONFIG["whale_size"])
-    big_asks = sum(float(x[1]) for x in ob["asks"] if float(x[1]) > CONFIG["whale_size"])
-
-    if big_bids > big_asks * 1.5:
-        return "Bullish"
-    elif big_asks > big_bids * 1.5:
-        return "Bearish"
-    return "Neutral"
-
-# ========= SWEEP =========
-def sweep(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    if last["h"] > prev["h"] and last["c"] < last["h"]:
-        return "Bearish"
-    if last["l"] < prev["l"] and last["c"] > last["l"]:
-        return "Bullish"
-    return None
-
-# ========= SENTIMENT =========
-def sentiment(df):
-    vol = df["v"].iloc[-1]
-    avg = df["v"].rolling(20).mean().iloc[-1]
-
-    if vol > avg * 4:
-        return "Extreme"
-    return "Normal"
-
-# ========= AI COMMENT =========
-def ai_comment(ob, whale_dir, sw):
-    parts = []
-
-    if whale_dir != "Neutral":
-        parts.append("Whale destekli")
-
-    if ob > 1.2:
-        parts.append("Alıcı güçlü")
-    elif ob < 0.8:
-        parts.append("Satıcı güçlü")
-
-    if sw:
-        parts.append(sw)
-
-    return " | ".join(parts) if parts else "Standart"
-
-# ========= LEVERAGE =========
-def calc_lev(score, vol, whale_dir):
-    lev = 2
-
-    if score > 70: lev += 2
-    elif score > 60: lev += 1
-
-    if whale_dir != "Neutral": lev += 1
-    if vol > 0.02: lev -= 1
-
-    return max(2, min(7, lev))
+    try:
+        client.futures_create_order(
+            symbol=sym,
+            side="BUY" if side=="LONG" else "SELL",
+            type="MARKET",
+            quantity=qty
+        )
+    except:
+        pass
 
 # ========= ANALYZE =========
 def analyze(sym):
-    global signal_count
-
-    # COIN FILTER
-    if sym in coin_stats:
-        data = coin_stats[sym]
-        if data["trades"] > 5:
-            wr = data["win"] / data["trades"]
-            if wr < 0.4:
-                return None
-
-    # HOUR FILTER
-    hour = datetime.now().hour
-    if hour in hour_stats:
-        data = hour_stats[hour]
-        if data["trades"] > 5:
-            wr = data["win"] / data["trades"]
-            if wr < 0.4:
-                return None
-
-    df5 = klines(sym, "5m")
-    df1h = klines(sym, "1h")
-    df4h = klines(sym, "4h")
-
-    price = df5["c"].iloc[-1]
-
-    trend5 = price > df5["c"].rolling(50).mean().iloc[-1]
-    trend1 = price > df1h["c"].rolling(50).mean().iloc[-1]
-    trend4 = price > df4h["c"].rolling(50).mean().iloc[-1]
-
-    if not (trend5 == trend1 == trend4):
-        return None
-
-    side = "LONG" if trend5 else "SHORT"
-
-    ob_ratio, ob = orderbook(sym)
-
-    if side == "LONG" and ob_ratio < 1.1:
-        return None
-    if side == "SHORT" and ob_ratio > 0.9:
-        return None
-
-    whale_dir = whale(ob)
-    sw = sweep(df5)
-
-    if sw == "Bullish" and side == "SHORT":
-        return None
-    if sw == "Bearish" and side == "LONG":
-        return None
-
-    if sentiment(df5) == "Extreme":
-        return None
-
-    vol = df5["v"].iloc[-1]
-    avg = df5["v"].rolling(20).mean().iloc[-1]
-
-    volSpike = vol > avg * CONFIG["vol_mult"]
-    momentum = df5["c"].iloc[-1] - df5["c"].iloc[-2]
-
-    score = 0
-    if volSpike: score += 2
-    if momentum != 0: score += 1
-    if whale_dir != "Neutral": score += 1
-
-    if score < 3:
-        return None
-
-    volatility = (df5["h"].iloc[-1] - df5["l"].iloc[-1]) / price
-    lev = calc_lev(score*20, volatility, whale_dir)
-
-    signal_count += 1
-
-    return side, df5, ob_ratio, whale_dir, sw, lev, score
-
-# ========= OPEN =========
-def open_trade(sym, side, df, ob, whale_dir, sw, lev, score):
-    global trade_count
+    df = klines(sym, "5m")
 
     price = df["c"].iloc[-1]
+    ma = df["c"].rolling(20).mean().iloc[-1]
 
-    sl = df["l"].iloc[-2] if side=="LONG" else df["h"].iloc[-2]
+    vol = df["v"].iloc[-1]
+    avg = df["v"].rolling(20).mean().iloc[-1]
+
+    momentum = df["c"].iloc[-1] - df["c"].iloc[-2]
+
+    features = [
+        price/ma,
+        vol/avg,
+        momentum
+    ]
+
+    ml_score = predict(features)
+
+    if ml_score < 0.6:
+        return None
+
+    side = "LONG" if momentum > 0 else "SHORT"
+
+    return side, price, features, ml_score
+
+# ========= PORTFOLIO =========
+def can_trade():
+    global daily_pnl
+
+    if len(positions) >= CONFIG["max_positions"]:
+        return False
+
+    if daily_pnl < CONFIG["daily_dd"]:
+        return False
+
+    return True
+
+# ========= OPEN =========
+def open_trade(sym, side, price, features, score):
+    global positions
+
+    if not can_trade():
+        return
+
+    sl = price * (0.99 if side=="LONG" else 1.01)
     risk = abs(price - sl)
+    tp = price + risk*CONFIG["RR"] if side=="LONG" else price - risk*CONFIG["RR"]
 
-    tp1 = price + risk*CONFIG["RR"] if side=="LONG" else price - risk*CONFIG["RR"]
+    qty = 10  # sabit (istersen dinamik yaparız)
+
+    open_order(sym, side, qty)
 
     positions[sym] = {
         "side": side,
         "entry": price,
         "sl": sl,
-        "tp1": tp1,
-        "tp_hit": False,
-        "peak": price
+        "tp": tp,
+        "features": features
     }
-
-    trade_count += 1
-
-    comment = ai_comment(ob, whale_dir, sw)
 
     send(f"""
 🚀 {side} {sym}
 
-💰 Entry: {round(price,4)}  
-📊 Size: %{CONFIG['RISK']*100}  
-⚡ Lev: {lev}x  
+Entry: {round(price,4)}
+TP: {round(tp,4)}
+SL: {round(sl,4)}
 
-━━━━━━━━━━━━━━━
-🎯 TP1: {round(tp1,4)}  
-━━━━━━━━━━━━━━━
-
-📊 Insight:
-• OB: {round(ob,2)}x  
-• Whale: {whale_dir}  
-• Sweep: {sw if sw else "None"}  
-
-🧠 AI: {comment}
+🧠 ML Score: {round(score*100,1)}%
 """)
 
 # ========= MANAGE =========
 def manage(sym):
+    global daily_pnl
+
     pos = positions[sym]
-    df = klines(sym, "5m")
-    price = df["c"].iloc[-1]
+    price = klines(sym, "5m")["c"].iloc[-1]
 
     entry = pos["entry"]
+
     pnl = (price-entry)/entry if pos["side"]=="LONG" else (entry-price)/entry
 
-    if price > pos["peak"]:
-        pos["peak"] = price
-
-    if not pos["tp_hit"]:
-        if (pos["side"]=="LONG" and price >= pos["tp1"]) or (pos["side"]=="SHORT" and price <= pos["tp1"]):
-            pos["tp_hit"] = True
-            send(f"💰 TP1 {sym}")
-
-    if price < pos["peak"]*(1-CONFIG["trail"]):
-        send(f"❌ EXIT {sym} %{round(pnl*100,2)}")
-
+    if pnl > 0.01 or pnl < -0.01:
         trade_history.append(pnl)
-        trade_log.append({"symbol": sym, "pnl": pnl})
+        daily_pnl += pnl
 
-        # COIN STATS
-        if sym not in coin_stats:
-            coin_stats[sym] = {"win":0,"trades":0}
+        # ML öğrenme
+        X_data.append(pos["features"])
+        y_data.append(1 if pnl > 0 else 0)
 
-        if pnl > 0:
-            coin_stats[sym]["win"] += 1
+        train_model()
 
-        coin_stats[sym]["trades"] += 1
-
-        # HOUR STATS
-        hour = datetime.now().hour
-
-        if hour not in hour_stats:
-            hour_stats[hour] = {"win":0,"trades":0}
-
-        if pnl > 0:
-            hour_stats[hour]["win"] += 1
-
-        hour_stats[hour]["trades"] += 1
+        send(f"❌ CLOSE {sym} PnL %{round(pnl*100,2)}")
 
         del positions[sym]
 
 # ========= MAIN =========
 def run():
-    global scan_count
-
-    for sym in symbols()[:200]:
-        scan_count += 1
+    for sym in symbols()[:100]:
 
         try:
             res = analyze(sym)
+
             if not res:
                 continue
 
-            side, df, ob, whale_dir, sw, lev, score = res
+            side, price, features, score = res
 
             if sym not in positions:
-                open_trade(sym, side, df, ob, whale_dir, sw, lev, score)
+                open_trade(sym, side, price, features, score)
 
             if sym in positions:
                 manage(sym)
