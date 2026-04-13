@@ -11,13 +11,16 @@ CONFIG = {
     "RISK": 0.01,
     "RR": 2,
     "trail": 0.01,
-    "vol_mult": 2,
     "max_positions": 3,
-    "daily_dd": -0.03
+    "daily_dd": -0.03,
+    "scan_limit": 100,
+    "tf": "5m",
+    "sleep": 30
 }
 
-LIVE = False  # TRUE yaparsan gerçek işlem açar
+LIVE = False
 
+# ========= ENV =========
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 API_KEY = os.getenv("BINANCE_KEY")
@@ -25,6 +28,7 @@ API_SECRET = os.getenv("BINANCE_SECRET")
 
 client = Client(API_KEY, API_SECRET)
 
+# ========= STATE =========
 positions = {}
 trade_history = []
 daily_pnl = 0
@@ -33,35 +37,30 @@ daily_pnl = 0
 model = RandomForestClassifier(n_estimators=50)
 X_data, y_data = [], []
 
-def train_model():
-    if len(X_data) > 50:
-        try:
-            model.fit(X_data, y_data)
-        except:
-            pass
-
-def predict(features):
-    try:
-        if len(X_data) < 50:
-            return 0.5
-        return model.predict_proba([features])[0][1]
-    except:
-        return 0.5
-
 # ========= TELEGRAM =========
 def send(msg):
     try:
+        if not TOKEN or not CHAT_ID:
+            return
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": msg}
         )
-    except:
-        pass
+    except Exception as e:
+        print("TG ERR:", e)
 
-# ========= DATA =========
-def klines(sym, tf):
+# ========= BINANCE DATA =========
+def symbols():
     try:
-        k = client.futures_klines(symbol=sym, interval=tf, limit=100)
+        data = client.futures_exchange_info()['symbols']
+        return [s['symbol'] for s in data if s['quoteAsset'] == "USDT"]
+    except Exception as e:
+        print("SYMBOL ERR:", e)
+        return []
+
+def klines(sym):
+    try:
+        k = client.futures_klines(symbol=sym, interval=CONFIG["tf"], limit=100)
         df = pd.DataFrame(k)
         df.columns = ["t","o","h","l","c","v","_","_","_","_","_","_"]
         df[["o","h","l","c","v"]] = df[["o","h","l","c","v"]].astype(float)
@@ -69,62 +68,43 @@ def klines(sym, tf):
     except:
         return None
 
-def symbols():
-    try:
-        return [s['symbol'] for s in client.futures_exchange_info()['symbols'] if s['quoteAsset']=="USDT"]
-    except:
-        return []
-
-# ========= SAFE FEATURE =========
-def safe_features(df):
+# ========= FEATURES =========
+def features(df):
     try:
         price = df["c"].iloc[-1]
         ma = df["c"].rolling(20).mean().iloc[-1]
         vol = df["v"].iloc[-1]
         avg = df["v"].rolling(20).mean().iloc[-1]
-        momentum = df["c"].iloc[-1] - df["c"].iloc[-2]
+        mom = df["c"].iloc[-1] - df["c"].iloc[-2]
 
-        # SAFE DIVISION
-        ma = ma if ma and not pd.isna(ma) else price
-        avg = avg if avg and not pd.isna(avg) else vol if vol != 0 else 1
+        ma = ma if not np.isnan(ma) else price
+        avg = avg if not np.isnan(avg) and avg != 0 else 1
 
-        ratio_price = price / ma if ma != 0 else 1
-        ratio_vol = vol / avg if avg != 0 else 1
-
-        # CLEAN
-        if np.isnan(ratio_price) or np.isinf(ratio_price):
-            ratio_price = 1
-        if np.isnan(ratio_vol) or np.isinf(ratio_vol):
-            ratio_vol = 1
-
-        return [ratio_price, ratio_vol, momentum]
-
+        return [
+            price / ma if ma != 0 else 1,
+            vol / avg,
+            mom
+        ]
     except:
         return None
 
-# ========= ANALYZE =========
-def analyze(sym):
-    df = klines(sym, "5m")
-    if df is None or len(df) < 30:
-        return None
+# ========= ML =========
+def train():
+    try:
+        if len(X_data) > 50:
+            model.fit(X_data, y_data)
+    except:
+        pass
 
-    features = safe_features(df)
-    if features is None:
-        return None
+def predict(x):
+    try:
+        if len(X_data) < 50:
+            return 0.5
+        return model.predict_proba([x])[0][1]
+    except:
+        return 0.5
 
-    score = predict(features)
-
-    if score < 0.6:
-        return None
-
-    momentum = features[2]
-    side = "LONG" if momentum > 0 else "SHORT"
-
-    price = df["c"].iloc[-1]
-
-    return side, price, features, score
-
-# ========= PORTFOLIO =========
+# ========= RISK =========
 def can_trade():
     if len(positions) >= CONFIG["max_positions"]:
         return False
@@ -133,101 +113,129 @@ def can_trade():
     return True
 
 # ========= ORDER =========
-def open_order(sym, side, qty):
+def order(sym, side, qty):
     if not LIVE:
         return
     try:
         client.futures_create_order(
             symbol=sym,
-            side="BUY" if side=="LONG" else "SELL",
+            side="BUY" if side == "LONG" else "SELL",
             type="MARKET",
             quantity=qty
         )
-    except:
-        pass
+    except Exception as e:
+        print("ORDER ERR:", e)
 
-# ========= OPEN =========
-def open_trade(sym, side, price, features, score):
+# ========= TRADE =========
+def open_trade(sym, side, price, f, score):
     if not can_trade():
         return
 
-    sl = price * (0.99 if side=="LONG" else 1.01)
+    sl = price * (0.99 if side == "LONG" else 1.01)
     risk = abs(price - sl)
-    tp = price + risk*CONFIG["RR"] if side=="LONG" else price - risk*CONFIG["RR"]
+    tp = price + risk * CONFIG["RR"] if side == "LONG" else price - risk * CONFIG["RR"]
 
     qty = 10
 
-    open_order(sym, side, qty)
+    order(sym, side, qty)
 
     positions[sym] = {
         "side": side,
         "entry": price,
         "sl": sl,
         "tp": tp,
-        "features": features
+        "features": f
     }
 
-    send(f"""
-🚀 {side} {sym}
+    send(f"""🚀 {sym} {side}
+Entry: {price}
+TP: {tp}
+SL: {sl}
+Score: {round(score*100,2)}%""")
 
-Entry: {round(price,4)}
-TP: {round(tp,4)}
-SL: {round(sl,4)}
+# ========= CLOSE =========
+def close_trade(sym, pnl):
+    global daily_pnl
 
-🧠 ML Score: {round(score*100,1)}%
-""")
+    trade_history.append(pnl)
+    daily_pnl += pnl
+
+    pos = positions[sym]
+    X_data.append(pos["features"])
+    y_data.append(1 if pnl > 0 else 0)
+
+    train()
+
+    send(f"❌ CLOSE {sym} PnL %{round(pnl*100,2)}")
+
+    del positions[sym]
 
 # ========= MANAGE =========
 def manage(sym):
-    global daily_pnl
+    try:
+        pos = positions[sym]
+        df = klines(sym)
+        if df is None:
+            return
 
-    pos = positions[sym]
-    df = klines(sym, "5m")
-    if df is None:
+        price = df["c"].iloc[-1]
+        entry = pos["entry"]
+
+        pnl = (price - entry) / entry if pos["side"] == "LONG" else (entry - price) / entry
+
+        if abs(pnl) > 0.01:
+            close_trade(sym, pnl)
+
+    except Exception as e:
+        print("MANAGE ERR:", e)
+
+# ========= ANALYZE =========
+def analyze(sym):
+    df = klines(sym)
+    if df is None or len(df) < 30:
         return
 
+    f = features(df)
+    if f is None:
+        return
+
+    score = predict(f)
+
+    if score < 0.6:
+        return
+
+    side = "LONG" if f[2] > 0 else "SHORT"
     price = df["c"].iloc[-1]
-    entry = pos["entry"]
 
-    pnl = (price-entry)/entry if pos["side"]=="LONG" else (entry-price)/entry
+    if sym not in positions:
+        open_trade(sym, side, price, f, score)
+    else:
+        manage(sym)
 
-    if abs(pnl) > 0.01:
-        trade_history.append(pnl)
-        daily_pnl += pnl
-
-        # ML öğrenme
-        X_data.append(pos["features"])
-        y_data.append(1 if pnl > 0 else 0)
-        train_model()
-
-        send(f"❌ CLOSE {sym} PnL %{round(pnl*100,2)}")
-
-        del positions[sym]
-
-# ========= MAIN =========
+# ========= RUN =========
 def run():
-    syms = symbols()[:100]
+    syms = symbols()[:CONFIG["scan_limit"]]
 
-    for sym in syms:
+    for s in syms:
         try:
-            res = analyze(sym)
-            if not res:
-                continue
+            analyze(s)
+        except Exception as e:
+            print("RUN ERR:", e)
 
-            side, price, features, score = res
+# ========= MAIN LOOP =========
+def main():
+    print("🚀 BOT STARTED")
 
-            if sym not in positions:
-                open_trade(sym, side, price, features, score)
+    send("🚀 Bot Started")
 
-            if sym in positions:
-                manage(sym)
+    while True:
+        try:
+            run()
+            time.sleep(CONFIG["sleep"])
+        except Exception as e:
+            print("LOOP ERR:", e)
+            time.sleep(5)
 
-        except:
-            continue
-
-while True:
-    try:
-        run()
-        time.sleep(60)
-    except:
-        time.sleep(60)
+# ========= ENTRY =========
+if __name__ == "__main__":
+    main()
