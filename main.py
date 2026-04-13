@@ -16,7 +16,7 @@ CONFIG = {
     "daily_dd": -0.03
 }
 
-LIVE = False  # 🔴 TRUE yapınca gerçek trade açar
+LIVE = False  # TRUE yaparsan gerçek işlem açar
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -29,42 +29,113 @@ positions = {}
 trade_history = []
 daily_pnl = 0
 
-# ========= ML MODEL =========
+# ========= ML =========
 model = RandomForestClassifier(n_estimators=50)
-
-X_data = []
-y_data = []
+X_data, y_data = [], []
 
 def train_model():
     if len(X_data) > 50:
-        model.fit(X_data, y_data)
+        try:
+            model.fit(X_data, y_data)
+        except:
+            pass
 
 def predict(features):
-    if len(X_data) < 50:
+    try:
+        if len(X_data) < 50:
+            return 0.5
+        return model.predict_proba([features])[0][1]
+    except:
         return 0.5
-    return model.predict_proba([features])[0][1]
 
 # ========= TELEGRAM =========
 def send(msg):
-    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  json={"chat_id": CHAT_ID, "text": msg})
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg}
+        )
+    except:
+        pass
 
 # ========= DATA =========
 def klines(sym, tf):
-    k = client.futures_klines(symbol=sym, interval=tf, limit=100)
-    df = pd.DataFrame(k)
-    df.columns = ["t","o","h","l","c","v","_","_","_","_","_","_"]
-    df[["o","h","l","c","v"]] = df[["o","h","l","c","v"]].astype(float)
-    return df
+    try:
+        k = client.futures_klines(symbol=sym, interval=tf, limit=100)
+        df = pd.DataFrame(k)
+        df.columns = ["t","o","h","l","c","v","_","_","_","_","_","_"]
+        df[["o","h","l","c","v"]] = df[["o","h","l","c","v"]].astype(float)
+        return df
+    except:
+        return None
 
 def symbols():
-    return [s['symbol'] for s in client.futures_exchange_info()['symbols'] if s['quoteAsset']=="USDT"]
+    try:
+        return [s['symbol'] for s in client.futures_exchange_info()['symbols'] if s['quoteAsset']=="USDT"]
+    except:
+        return []
+
+# ========= SAFE FEATURE =========
+def safe_features(df):
+    try:
+        price = df["c"].iloc[-1]
+        ma = df["c"].rolling(20).mean().iloc[-1]
+        vol = df["v"].iloc[-1]
+        avg = df["v"].rolling(20).mean().iloc[-1]
+        momentum = df["c"].iloc[-1] - df["c"].iloc[-2]
+
+        # SAFE DIVISION
+        ma = ma if ma and not pd.isna(ma) else price
+        avg = avg if avg and not pd.isna(avg) else vol if vol != 0 else 1
+
+        ratio_price = price / ma if ma != 0 else 1
+        ratio_vol = vol / avg if avg != 0 else 1
+
+        # CLEAN
+        if np.isnan(ratio_price) or np.isinf(ratio_price):
+            ratio_price = 1
+        if np.isnan(ratio_vol) or np.isinf(ratio_vol):
+            ratio_vol = 1
+
+        return [ratio_price, ratio_vol, momentum]
+
+    except:
+        return None
+
+# ========= ANALYZE =========
+def analyze(sym):
+    df = klines(sym, "5m")
+    if df is None or len(df) < 30:
+        return None
+
+    features = safe_features(df)
+    if features is None:
+        return None
+
+    score = predict(features)
+
+    if score < 0.6:
+        return None
+
+    momentum = features[2]
+    side = "LONG" if momentum > 0 else "SHORT"
+
+    price = df["c"].iloc[-1]
+
+    return side, price, features, score
+
+# ========= PORTFOLIO =========
+def can_trade():
+    if len(positions) >= CONFIG["max_positions"]:
+        return False
+    if daily_pnl < CONFIG["daily_dd"]:
+        return False
+    return True
 
 # ========= ORDER =========
 def open_order(sym, side, qty):
     if not LIVE:
         return
-
     try:
         client.futures_create_order(
             symbol=sym,
@@ -75,49 +146,8 @@ def open_order(sym, side, qty):
     except:
         pass
 
-# ========= ANALYZE =========
-def analyze(sym):
-    df = klines(sym, "5m")
-
-    price = df["c"].iloc[-1]
-    ma = df["c"].rolling(20).mean().iloc[-1]
-
-    vol = df["v"].iloc[-1]
-    avg = df["v"].rolling(20).mean().iloc[-1]
-
-    momentum = df["c"].iloc[-1] - df["c"].iloc[-2]
-
-    features = [
-        price/ma,
-        vol/avg,
-        momentum
-    ]
-
-    ml_score = predict(features)
-
-    if ml_score < 0.6:
-        return None
-
-    side = "LONG" if momentum > 0 else "SHORT"
-
-    return side, price, features, ml_score
-
-# ========= PORTFOLIO =========
-def can_trade():
-    global daily_pnl
-
-    if len(positions) >= CONFIG["max_positions"]:
-        return False
-
-    if daily_pnl < CONFIG["daily_dd"]:
-        return False
-
-    return True
-
 # ========= OPEN =========
 def open_trade(sym, side, price, features, score):
-    global positions
-
     if not can_trade():
         return
 
@@ -125,7 +155,7 @@ def open_trade(sym, side, price, features, score):
     risk = abs(price - sl)
     tp = price + risk*CONFIG["RR"] if side=="LONG" else price - risk*CONFIG["RR"]
 
-    qty = 10  # sabit (istersen dinamik yaparız)
+    qty = 10
 
     open_order(sym, side, qty)
 
@@ -152,20 +182,22 @@ def manage(sym):
     global daily_pnl
 
     pos = positions[sym]
-    price = klines(sym, "5m")["c"].iloc[-1]
+    df = klines(sym, "5m")
+    if df is None:
+        return
 
+    price = df["c"].iloc[-1]
     entry = pos["entry"]
 
     pnl = (price-entry)/entry if pos["side"]=="LONG" else (entry-price)/entry
 
-    if pnl > 0.01 or pnl < -0.01:
+    if abs(pnl) > 0.01:
         trade_history.append(pnl)
         daily_pnl += pnl
 
         # ML öğrenme
         X_data.append(pos["features"])
         y_data.append(1 if pnl > 0 else 0)
-
         train_model()
 
         send(f"❌ CLOSE {sym} PnL %{round(pnl*100,2)}")
@@ -174,11 +206,11 @@ def manage(sym):
 
 # ========= MAIN =========
 def run():
-    for sym in symbols()[:100]:
+    syms = symbols()[:100]
 
+    for sym in syms:
         try:
             res = analyze(sym)
-
             if not res:
                 continue
 
@@ -194,5 +226,8 @@ def run():
             continue
 
 while True:
-    run()
-    time.sleep(60)
+    try:
+        run()
+        time.sleep(60)
+    except:
+        time.sleep(60)
