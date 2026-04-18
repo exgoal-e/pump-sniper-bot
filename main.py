@@ -1,7 +1,7 @@
 from binance.client import Client
 import pandas as pd
 import time, os, requests
-from datetime import datetime
+from datetime import datetime, UTC
 
 # ========= CONFIG =========
 CONFIG = {
@@ -9,7 +9,8 @@ CONFIG = {
     "RR": 2,
     "trail": 0.01,
     "vol_mult": 2,
-    "max_open_trades": 5
+    "max_open_trades": 5,
+    "debug": True
 }
 
 TOKEN = os.getenv("TOKEN")
@@ -30,6 +31,14 @@ daily_pnl = 0
 coin_stats = {}
 pattern_stats = {"LONG": [], "SHORT": []}
 hour_stats = {}
+
+# DEBUG MEMORY
+debug_stats = {
+    "MACD_fail": 0,
+    "VOL_fail": 0,
+    "BREAK_fail": 0,
+    "STRONG_fail": 0
+}
 
 last_report_day = None
 
@@ -65,7 +74,7 @@ def symbols():
 
 # ========= ANALYZE =========
 def analyze(sym):
-    global signal_count
+    global signal_count, debug_stats
 
     df = klines(sym, "5m")
     if df is None:
@@ -73,10 +82,7 @@ def analyze(sym):
 
     price = df["c"].iloc[-1]
     ma = df["c"].rolling(50).mean().iloc[-1]
-    if pd.isna(ma):
-        return None
-
-    if price < ma:
+    if pd.isna(ma) or price < ma:
         return None
 
     macd_line, signal_line = macd(df)
@@ -95,6 +101,34 @@ def analyze(sym):
     body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
     rng = df["h"].iloc[-1] - df["l"].iloc[-1]
     strong = body > rng * 0.6
+
+    # ===== DEBUG =====
+    if CONFIG["debug"]:
+        if not macd_cross: debug_stats["MACD_fail"] += 1
+        if not volSpike: debug_stats["VOL_fail"] += 1
+        if not breakout: debug_stats["BREAK_fail"] += 1
+        if not strong: debug_stats["STRONG_fail"] += 1
+
+        # her 200 scan'de 1 mesaj
+        total_debug = sum(debug_stats.values())
+        if total_debug % 200 == 0 and total_debug > 0:
+            send(f"""
+🧠 DEBUG ANALİZ
+
+MACD Fail: {debug_stats['MACD_fail']}
+VOL Fail: {debug_stats['VOL_fail']}
+BREAK Fail: {debug_stats['BREAK_fail']}
+STRONG Fail: {debug_stats['STRONG_fail']}
+
+VOL Mult: {CONFIG['vol_mult']}
+""")
+
+    # ===== AI OPTIMIZE =====
+    if CONFIG["debug"]:
+        if debug_stats["VOL_fail"] > 500:
+            CONFIG["vol_mult"] = max(1.5, CONFIG["vol_mult"] - 0.1)
+            debug_stats["VOL_fail"] = 0
+            send(f"🤖 AI Optimize: VOL filtresi gevşetildi → {CONFIG['vol_mult']}")
 
     if not (macd_cross and volSpike and breakout and strong):
         return None
@@ -128,7 +162,7 @@ def open_trade(sym, side, df):
     }
 
     trade_count += 1
-    hour = datetime.utcnow().hour
+    hour = datetime.now(UTC).hour
     hour_stats[hour] = hour_stats.get(hour, 0) + 1
 
     send(f"""
@@ -183,8 +217,6 @@ def manage(sym):
         del positions[sym]
 
 # ========= REPORT =========
-from datetime import datetime, UTC
-
 def send_daily_report():
     global last_report_day
 
