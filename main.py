@@ -186,7 +186,9 @@ def manage(sym):
 def send_daily_report():
     global last_report_day
 
-    now = datetime.utcnow()
+    from datetime import datetime, UTC
+
+now = datetime.now(UTC)
 
     if not (now.hour == 23 and now.minute < 10):
         return
