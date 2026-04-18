@@ -9,12 +9,7 @@ CONFIG = {
     "RR": 2,
     "trail": 0.01,
     "vol_mult": 2,
-    "max_pos_usdt": 50,
-    "min_pos_usdt": 5,
-    "scale_trigger": 0.01,
-    "max_scale": 1,
-    "max_open_trades": 5,
-    "min_conf": 60
+    "max_open_trades": 5
 }
 
 TOKEN = os.getenv("TOKEN")
@@ -25,6 +20,17 @@ API_SECRET = os.getenv("BINANCE_SECRET")
 client = Client(API_KEY, API_SECRET)
 
 positions = {}
+
+# ========= STATS =========
+scan_count = 0
+trade_count = 0
+daily_pnl = 0
+
+coin_stats = {}
+hour_stats = {}
+pattern_stats = {}
+
+last_report_day = None
 
 # ========= TELEGRAM =========
 def send(msg):
@@ -58,46 +64,51 @@ def symbols():
 
 # ========= ANALYZE =========
 def analyze(sym):
-    df = klines(sym, "5m")
-    if df is None:
+    df5 = klines(sym, "5m")
+    df1h = klines(sym, "1h")
+
+    if df5 is None or df1h is None:
         return None
 
-    price = df["c"].iloc[-1]
-    ma = df["c"].rolling(50).mean().iloc[-1]
-    if pd.isna(ma):
+    price = df5["c"].iloc[-1]
+    ma5 = df5["c"].rolling(50).mean().iloc[-1]
+    ma1h = df1h["c"].rolling(50).mean().iloc[-1]
+
+    if pd.isna(ma5) or pd.isna(ma1h):
         return None
 
-    # 💣 LONG ONLY
-    side = "LONG" if price > ma else None
-    if side is None:
+    # LONG ONLY + MTF
+    if not (price > ma5 and price > ma1h):
         return None
 
-    macd_line, signal_line = macd(df)
+    macd_line, signal_line = macd(df5)
     macd_cross = macd_line.iloc[-2] < signal_line.iloc[-2] and macd_line.iloc[-1] > signal_line.iloc[-1]
 
-    vol = df["v"].iloc[-1]
-    avg = df["v"].rolling(20).mean().iloc[-1]
-    if avg == 0 or pd.isna(avg):
+    vol = df5["v"].iloc[-1]
+    avg = df5["v"].rolling(20).mean().iloc[-1]
+
+    if avg == 0:
         return None
 
     volSpike = vol > avg * CONFIG["vol_mult"]
 
-    # breakout + fake filter
-    recent_high = df["h"].rolling(20).max().iloc[-2]
+    recent_high = df5["h"].rolling(20).max().iloc[-2]
     breakout = price > recent_high
 
-    body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
-    candle_range = df["h"].iloc[-1] - df["l"].iloc[-1]
-    strong_candle = body > candle_range * 0.6
+    body = abs(df5["c"].iloc[-1] - df5["o"].iloc[-1])
+    rng = df5["h"].iloc[-1] - df5["l"].iloc[-1]
 
-    if not (macd_cross and volSpike and breakout and strong_candle):
+    strong = body > rng * 0.6
+
+    if not (macd_cross and volSpike and breakout and strong):
         return None
 
-    confidence = 80
-    return side, df, confidence
+    return "LONG", df5
 
 # ========= OPEN =========
-def open_trade(sym, side, df, confidence):
+def open_trade(sym, side, df):
+    global trade_count, hour_stats
+
     if len(positions) >= CONFIG["max_open_trades"]:
         return
 
@@ -106,75 +117,112 @@ def open_trade(sym, side, df, confidence):
 
     risk = abs(price - sl)
 
-    tp1 = price + risk*0.5
-    tp2 = price + risk*0.8
-    tp3 = price + risk*1.3
+    tp = price + risk * CONFIG["RR"]
 
     positions[sym] = {
-        "side": side,
         "entry": price,
         "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "peak": price,
-        "scale": 0
+        "tp": tp,
+        "peak": price
     }
 
-    send(f"""
-🚀 LONG {sym} (SNIPER)
+    trade_count += 1
+    hour = datetime.utcnow().hour
+    hour_stats[hour] = hour_stats.get(hour, 0) + 1
 
-💰 Entry: {round(price,4)}
-🎯 Confidence: {confidence}
-
-TP1: {round(tp1,4)}
-TP2: {round(tp2,4)}
-TP3: {round(tp3,4)}
-
-SL: {round(sl,4)}
-""")
+    send(f"🚀 LONG {sym} | Entry: {price} TP: {tp} SL: {sl}")
 
 # ========= MANAGE =========
 def manage(sym):
+    global daily_pnl, coin_stats
+
     pos = positions[sym]
     df = klines(sym, "5m")
+
     if df is None:
         return
 
     price = df["c"].iloc[-1]
+
     pnl = (price - pos["entry"]) / pos["entry"]
 
-    if not pos["tp1_hit"] and price >= pos["tp1"]:
-        pos["tp1_hit"] = True
-        send(f"💰 TP1 {sym}")
-
-    # scale sadece tp1 sonrası
-    if pos["tp1_hit"] and pnl > CONFIG["scale_trigger"] and pos["scale"] < CONFIG["max_scale"]:
-        pos["scale"] += 1
-        send(f"➕ SCALE {sym}")
-
-    # trailing
     if price > pos["peak"]:
         pos["peak"] = price
 
     if price < pos["peak"]*(1-CONFIG["trail"]):
+        daily_pnl += pnl
+
+        coin_stats.setdefault(sym, []).append(pnl)
+
         send(f"❌ EXIT {sym} %{round(pnl*100,2)}")
         del positions[sym]
 
+# ========= REPORT =========
+def send_daily_report():
+    global last_report_day
+
+    now = datetime.utcnow()
+
+    if not (now.hour == 23 and now.minute < 10):
+        return
+
+    if last_report_day == now.day:
+        return
+
+    last_report_day = now.day
+
+    total = sum(len(v) for v in coin_stats.values()) or 1
+    wins = sum(sum(1 for x in v if x > 0) for v in coin_stats.values())
+
+    winrate = wins / total * 100
+
+    best = sorted(coin_stats.items(), key=lambda x: sum(x[1])/len(x[1]) if x[1] else 0, reverse=True)[:3]
+
+    best_text = "\n".join([f"{c} → %{round(sum(v)/len(v)*100,1)}" for c,v in best if v])
+
+    best_hour = max(hour_stats, key=hour_stats.get) if hour_stats else "N/A"
+
+    ai = "Stabil"
+    if winrate < 45:
+        ai = "⚠️ Filtre artır"
+    elif winrate > 60:
+        ai = "🔥 Güçlü"
+
+    send(f"""
+📊 GÜNLÜK RAPOR
+
+Tarandı: {scan_count}
+Trade: {trade_count}
+
+Winrate: %{round(winrate,2)}
+PnL: %{round(daily_pnl*100,2)}
+
+🔥 En iyi coinler:
+{best_text}
+
+⏱ En iyi saat:
+{best_hour}
+
+🧠 AI:
+{ai}
+""")
+
 # ========= MAIN =========
 def run():
+    global scan_count
+
     for sym in symbols()[:100]:
+        scan_count += 1
+
         try:
             res = analyze(sym)
             if not res:
                 continue
 
-            side, df, conf = res
+            side, df = res
 
             if sym not in positions:
-                open_trade(sym, side, df, conf)
+                open_trade(sym, side, df)
 
             if sym in positions:
                 manage(sym)
@@ -184,4 +232,5 @@ def run():
 
 while True:
     run()
+    send_daily_report()
     time.sleep(60)
