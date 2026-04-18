@@ -23,12 +23,13 @@ positions = {}
 
 # ========= STATS =========
 scan_count = 0
+signal_count = 0
 trade_count = 0
 daily_pnl = 0
 
 coin_stats = {}
+pattern_stats = {"LONG": [], "SHORT": []}
 hour_stats = {}
-pattern_stats = {}
 
 last_report_day = None
 
@@ -64,46 +65,42 @@ def symbols():
 
 # ========= ANALYZE =========
 def analyze(sym):
-    df5 = klines(sym, "5m")
-    df1h = klines(sym, "1h")
+    global signal_count
 
-    if df5 is None or df1h is None:
+    df = klines(sym, "5m")
+    if df is None:
         return None
 
-    price = df5["c"].iloc[-1]
-    ma5 = df5["c"].rolling(50).mean().iloc[-1]
-    ma1h = df1h["c"].rolling(50).mean().iloc[-1]
-
-    if pd.isna(ma5) or pd.isna(ma1h):
+    price = df["c"].iloc[-1]
+    ma = df["c"].rolling(50).mean().iloc[-1]
+    if pd.isna(ma):
         return None
 
-    # LONG ONLY + MTF
-    if not (price > ma5 and price > ma1h):
+    if price < ma:
         return None
 
-    macd_line, signal_line = macd(df5)
+    macd_line, signal_line = macd(df)
     macd_cross = macd_line.iloc[-2] < signal_line.iloc[-2] and macd_line.iloc[-1] > signal_line.iloc[-1]
 
-    vol = df5["v"].iloc[-1]
-    avg = df5["v"].rolling(20).mean().iloc[-1]
-
+    vol = df["v"].iloc[-1]
+    avg = df["v"].rolling(20).mean().iloc[-1]
     if avg == 0:
         return None
 
     volSpike = vol > avg * CONFIG["vol_mult"]
 
-    recent_high = df5["h"].rolling(20).max().iloc[-2]
+    recent_high = df["h"].rolling(20).max().iloc[-2]
     breakout = price > recent_high
 
-    body = abs(df5["c"].iloc[-1] - df5["o"].iloc[-1])
-    rng = df5["h"].iloc[-1] - df5["l"].iloc[-1]
-
+    body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
+    rng = df["h"].iloc[-1] - df["l"].iloc[-1]
     strong = body > rng * 0.6
 
     if not (macd_cross and volSpike and breakout and strong):
         return None
 
-    return "LONG", df5
+    signal_count += 1
+    return "LONG", df
 
 # ========= OPEN =========
 def open_trade(sym, side, df):
@@ -117,12 +114,16 @@ def open_trade(sym, side, df):
 
     risk = abs(price - sl)
 
-    tp = price + risk * CONFIG["RR"]
+    tp1 = price + risk * 0.5
+    tp2 = price + risk * 0.8
 
     positions[sym] = {
         "entry": price,
         "sl": sl,
-        "tp": tp,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp1_hit": False,
+        "tp2_hit": False,
         "peak": price
     }
 
@@ -130,21 +131,44 @@ def open_trade(sym, side, df):
     hour = datetime.utcnow().hour
     hour_stats[hour] = hour_stats.get(hour, 0) + 1
 
-    send(f"🚀 LONG {sym} | Entry: {price} TP: {tp} SL: {sl}")
+    send(f"""
+🚀 LONG {sym} (SNIPER)
+
+💰 Entry: {round(price,4)}
+
+━━━━━━━━━━━━━━━
+🎯 TP LEVELS
+→ TP1: {round(tp1,4)} (%50)
+→ TP2: {round(tp2,4)} (%30)
+→ Runner: ACTIVE 🔥
+━━━━━━━━━━━━━━━
+
+📉 Trailing: Active
+🛑 SL: {round(sl,4)}
+
+🔗 Chart:
+https://www.tradingview.com/chart/?symbol=BINANCE:{sym}
+""")
 
 # ========= MANAGE =========
 def manage(sym):
-    global daily_pnl, coin_stats
+    global daily_pnl, coin_stats, pattern_stats
 
     pos = positions[sym]
     df = klines(sym, "5m")
-
     if df is None:
         return
 
     price = df["c"].iloc[-1]
-
     pnl = (price - pos["entry"]) / pos["entry"]
+
+    if not pos["tp1_hit"] and price >= pos["tp1"]:
+        pos["tp1_hit"] = True
+        send(f"💰 TP1 HIT {sym} (%50)")
+
+    if not pos["tp2_hit"] and price >= pos["tp2"]:
+        pos["tp2_hit"] = True
+        send(f"💰 TP2 HIT {sym} (%30)")
 
     if price > pos["peak"]:
         pos["peak"] = price
@@ -153,6 +177,7 @@ def manage(sym):
         daily_pnl += pnl
 
         coin_stats.setdefault(sym, []).append(pnl)
+        pattern_stats["LONG"].append(pnl)
 
         send(f"❌ EXIT {sym} %{round(pnl*100,2)}")
         del positions[sym]
@@ -173,12 +198,12 @@ def send_daily_report():
 
     total = sum(len(v) for v in coin_stats.values()) or 1
     wins = sum(sum(1 for x in v if x > 0) for v in coin_stats.values())
-
     winrate = wins / total * 100
 
     best = sorted(coin_stats.items(), key=lambda x: sum(x[1])/len(x[1]) if x[1] else 0, reverse=True)[:3]
-
     best_text = "\n".join([f"{c} → %{round(sum(v)/len(v)*100,1)}" for c,v in best if v])
+
+    worst_pattern = min(pattern_stats, key=lambda x: sum(pattern_stats[x])/len(pattern_stats[x]) if pattern_stats[x] else 0)
 
     best_hour = max(hour_stats, key=hour_stats.get) if hour_stats else "N/A"
 
@@ -192,6 +217,7 @@ def send_daily_report():
 📊 GÜNLÜK RAPOR
 
 Tarandı: {scan_count}
+Sinyal: {signal_count}
 Trade: {trade_count}
 
 Winrate: %{round(winrate,2)}
@@ -200,10 +226,13 @@ PnL: %{round(daily_pnl*100,2)}
 🔥 En iyi coinler:
 {best_text}
 
-⏱ En iyi saat:
-{best_hour}
+❌ En kötü pattern:
+{worst_pattern}
 
-🧠 AI:
+⏱ En iyi saat:
+{best_hour}:00
+
+🧠 AI Yorum:
 {ai}
 """)
 
