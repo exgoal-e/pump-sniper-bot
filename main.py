@@ -183,12 +183,12 @@ def manage(sym):
         del positions[sym]
 
 # ========= REPORT =========
+from datetime import datetime, UTC
+
 def send_daily_report():
     global last_report_day
 
-    from datetime import datetime, UTC
-
-now = datetime.now(UTC)
+    now = datetime.now(UTC)
 
     if not (now.hour == 23 and now.minute < 10):
         return
