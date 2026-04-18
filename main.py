@@ -10,7 +10,8 @@ CONFIG = {
     "trail": 0.01,
     "vol_mult": 2,
     "max_open_trades": 5,
-    "debug": True
+    "debug": True,
+    "regime_filter": True
 }
 
 TOKEN = os.getenv("TOKEN")
@@ -32,7 +33,6 @@ coin_stats = {}
 pattern_stats = {"LONG": [], "SHORT": []}
 hour_stats = {}
 
-# DEBUG MEMORY
 debug_stats = {
     "MACD_fail": 0,
     "VOL_fail": 0,
@@ -45,8 +45,10 @@ last_report_day = None
 # ========= TELEGRAM =========
 def send(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": msg})
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg}
+        )
     except:
         pass
 
@@ -70,27 +72,36 @@ def klines(sym, tf):
         return None
 
 def symbols():
-    return [s['symbol'] for s in client.futures_exchange_info()['symbols'] if s['quoteAsset']=="USDT"]
+    try:
+        return [s['symbol'] for s in client.futures_exchange_info()['symbols'] if s['quoteAsset']=="USDT"]
+    except:
+        return []
 
 # ========= ANALYZE =========
 def analyze(sym):
     global signal_count, debug_stats
 
     df = klines(sym, "5m")
-    if df is None:
+    if df is None or len(df) < 50:
         return None
 
     price = df["c"].iloc[-1]
     ma = df["c"].rolling(50).mean().iloc[-1]
+
     if pd.isna(ma) or price < ma:
         return None
 
     macd_line, signal_line = macd(df)
+
+    if len(macd_line) < 2:
+        return None
+
     macd_cross = macd_line.iloc[-2] < signal_line.iloc[-2] and macd_line.iloc[-1] > signal_line.iloc[-1]
 
     vol = df["v"].iloc[-1]
     avg = df["v"].rolling(20).mean().iloc[-1]
-    if avg == 0:
+
+    if avg == 0 or pd.isna(avg):
         return None
 
     volSpike = vol > avg * CONFIG["vol_mult"]
@@ -100,35 +111,49 @@ def analyze(sym):
 
     body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
     rng = df["h"].iloc[-1] - df["l"].iloc[-1]
+
+    if rng == 0:
+        return None
+
     strong = body > rng * 0.6
 
-    # ===== DEBUG =====
+    # ========= DEBUG =========
     if CONFIG["debug"]:
         if not macd_cross: debug_stats["MACD_fail"] += 1
         if not volSpike: debug_stats["VOL_fail"] += 1
         if not breakout: debug_stats["BREAK_fail"] += 1
         if not strong: debug_stats["STRONG_fail"] += 1
 
-        # her 200 scan'de 1 mesaj
-        total_debug = sum(debug_stats.values())
-        if total_debug % 200 == 0 and total_debug > 0:
+        total = sum(debug_stats.values())
+        if total % 300 == 0 and total > 0:
             send(f"""
-🧠 DEBUG ANALİZ
+🧠 DEBUG
 
-MACD Fail: {debug_stats['MACD_fail']}
-VOL Fail: {debug_stats['VOL_fail']}
-BREAK Fail: {debug_stats['BREAK_fail']}
-STRONG Fail: {debug_stats['STRONG_fail']}
+MACD: {debug_stats['MACD_fail']}
+VOL: {debug_stats['VOL_fail']}
+BREAK: {debug_stats['BREAK_fail']}
+STRONG: {debug_stats['STRONG_fail']}
 
 VOL Mult: {CONFIG['vol_mult']}
 """)
 
-    # ===== AI OPTIMIZE =====
+    # ========= AI OPTIMIZE =========
     if CONFIG["debug"]:
-        if debug_stats["VOL_fail"] > 500:
+        if debug_stats["VOL_fail"] > 600:
             CONFIG["vol_mult"] = max(1.5, CONFIG["vol_mult"] - 0.1)
             debug_stats["VOL_fail"] = 0
-            send(f"🤖 AI Optimize: VOL filtresi gevşetildi → {CONFIG['vol_mult']}")
+            send(f"🤖 AI Optimize → VOL {CONFIG['vol_mult']}")
+
+    # ========= REGIME =========
+    if CONFIG["regime_filter"]:
+        fails = sum([
+            not macd_cross,
+            not breakout,
+            not strong,
+            not volSpike
+        ])
+        if fails >= 3:
+            return None
 
     if not (macd_cross and volSpike and breakout and strong):
         return None
@@ -137,7 +162,7 @@ VOL Mult: {CONFIG['vol_mult']}
     return "LONG", df
 
 # ========= OPEN =========
-def open_trade(sym, side, df):
+def open_trade(sym, df):
     global trade_count, hour_stats
 
     if len(positions) >= CONFIG["max_open_trades"]:
@@ -147,6 +172,8 @@ def open_trade(sym, side, df):
     sl = df["l"].iloc[-2]
 
     risk = abs(price - sl)
+    if risk == 0:
+        return
 
     tp1 = price + risk * 0.5
     tp2 = price + risk * 0.8
@@ -179,9 +206,6 @@ def open_trade(sym, side, df):
 
 📉 Trailing: Active
 🛑 SL: {round(sl,4)}
-
-🔗 Chart:
-https://www.tradingview.com/chart/?symbol=BINANCE:{sym}
 """)
 
 # ========= MANAGE =========
@@ -198,16 +222,16 @@ def manage(sym):
 
     if not pos["tp1_hit"] and price >= pos["tp1"]:
         pos["tp1_hit"] = True
-        send(f"💰 TP1 HIT {sym} (%50)")
+        send(f"💰 TP1 {sym}")
 
     if not pos["tp2_hit"] and price >= pos["tp2"]:
         pos["tp2_hit"] = True
-        send(f"💰 TP2 HIT {sym} (%30)")
+        send(f"💰 TP2 {sym}")
 
     if price > pos["peak"]:
         pos["peak"] = price
 
-    if price < pos["peak"]*(1-CONFIG["trail"]):
+    if price < pos["peak"] * (1 - CONFIG["trail"]):
         daily_pnl += pnl
 
         coin_stats.setdefault(sym, []).append(pnl)
@@ -232,12 +256,19 @@ def send_daily_report():
 
     total = sum(len(v) for v in coin_stats.values()) or 1
     wins = sum(sum(1 for x in v if x > 0) for v in coin_stats.values())
+
     winrate = wins / total * 100
 
-    best = sorted(coin_stats.items(), key=lambda x: sum(x[1])/len(x[1]) if x[1] else 0, reverse=True)[:3]
-    best_text = "\n".join([f"{c} → %{round(sum(v)/len(v)*100,1)}" for c,v in best if v])
+    best = sorted(
+        coin_stats.items(),
+        key=lambda x: sum(x[1])/len(x[1]) if x[1] else 0,
+        reverse=True
+    )[:3]
 
-    worst_pattern = min(pattern_stats, key=lambda x: sum(pattern_stats[x])/len(pattern_stats[x]) if pattern_stats[x] else 0)
+    best_text = "\n".join([
+        f"{c} → %{round(sum(v)/len(v)*100,1)}"
+        for c, v in best if v
+    ])
 
     best_hour = max(hour_stats, key=hour_stats.get) if hour_stats else "N/A"
 
@@ -260,9 +291,6 @@ PnL: %{round(daily_pnl*100,2)}
 🔥 En iyi coinler:
 {best_text}
 
-❌ En kötü pattern:
-{worst_pattern}
-
 ⏱ En iyi saat:
 {best_hour}:00
 
@@ -282,10 +310,10 @@ def run():
             if not res:
                 continue
 
-            side, df = res
+            _, df = res
 
             if sym not in positions:
-                open_trade(sym, side, df)
+                open_trade(sym, df)
 
             if sym in positions:
                 manage(sym)
