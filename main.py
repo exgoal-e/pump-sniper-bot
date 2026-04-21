@@ -114,14 +114,14 @@ def analyze(sym):
     recent_high = df["h"].rolling(20).max().iloc[-2]
     recent_low = df["l"].rolling(20).min().iloc[-2]
 
-    breakout = price > recent_high
+    breakout = price > recent_high * 0.995  # erken giriş
 
     body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
     rng = df["h"].iloc[-1] - df["l"].iloc[-1]
     if rng == 0:
         return None
 
-    strong = body > rng * 0.6
+    strong = body > rng * 0.5
 
     # DEBUG
     if CONFIG["debug"]:
@@ -130,19 +130,6 @@ def analyze(sym):
         if not breakout: debug_stats["BREAK_fail"] += 1
         if not strong: debug_stats["STRONG_fail"] += 1
 
-        total = sum(debug_stats.values())
-        if total % 300 == 0 and total > 0:
-            send(f"""
-🧠 DEBUG
-
-MACD: {debug_stats['MACD_fail']}
-VOL: {debug_stats['VOL_fail']}
-BREAK: {debug_stats['BREAK_fail']}
-STRONG: {debug_stats['STRONG_fail']}
-
-VOL Mult: {CONFIG['vol_mult']}
-""")
-
     # AI optimize
     if CONFIG["debug"]:
         if debug_stats["VOL_fail"] > 600:
@@ -150,21 +137,18 @@ VOL Mult: {CONFIG['vol_mult']}
             debug_stats["VOL_fail"] = 0
             send(f"🤖 AI Optimize → VOL {CONFIG['vol_mult']}")
 
-    fails = sum([
-        not macd_cross,
-        not breakout,
-        not strong,
-        not volSpike
-    ])
-
     # TREND
-    if fails < 3:
-        if macd_cross and volSpike and breakout and strong and price > ma:
-            signal_count += 1
-            return "LONG", df, "TREND"
+    if macd_cross and volSpike and breakout and price > ma:
+        signal_count += 1
+        return "LONG", df, "TREND"
 
     # RANGE
     if CONFIG["range_mode"]:
+
+        # trend varsa range yok
+        if price > ma:
+            return None
+
         r = rsi(df)
         if r is None or len(r) < 2:
             return None
@@ -172,11 +156,14 @@ VOL Mult: {CONFIG['vol_mult']}
         near_low = price <= recent_low * 1.01
         near_high = price >= recent_high * 0.99
 
-        if near_low and r.iloc[-1] < 30:
+        bullish = df["c"].iloc[-1] > df["o"].iloc[-1] and df["c"].iloc[-2] > df["o"].iloc[-2]
+        bearish = df["c"].iloc[-1] < df["o"].iloc[-1] and df["c"].iloc[-2] < df["o"].iloc[-2]
+
+        if near_low and r.iloc[-1] < 30 and bullish:
             signal_count += 1
             return "LONG", df, "RANGE"
 
-        if near_high and r.iloc[-1] > 70:
+        if near_high and r.iloc[-1] > 70 and bearish:
             signal_count += 1
             return "SHORT", df, "RANGE"
 
@@ -227,7 +214,7 @@ def open_trade(sym, side, df, mode):
 → Runner: ACTIVE 🔥
 ━━━━━━━━━━━━━━━
 
-📉 Trailing: Active
+📉 Trailing: TP2 sonrası aktif
 🛑 SL: {round(sl,4)}
 """)
 
@@ -254,18 +241,20 @@ def manage(sym):
             pos["tp2_hit"] = True
             send(f"💰 TP2 {sym}")
 
-    if price > pos["peak"]:
-        pos["peak"] = price
+    # TRAILING SADECE TP2 SONRASI
+    if pos["tp2_hit"]:
+        if price > pos["peak"]:
+            pos["peak"] = price
 
-    if price < pos["peak"] * (1 - CONFIG["trail"]):
-        daily_pnl += pnl
+        if price < pos["peak"] * (1 - CONFIG["trail"]):
+            daily_pnl += pnl
 
-        coin_stats.setdefault(sym, []).append(pnl)
-        pattern_stats[pos["side"]].append(pnl)
-        mode_stats[pos["mode"]].append(pnl)
+            coin_stats.setdefault(sym, []).append(pnl)
+            pattern_stats[pos["side"]].append(pnl)
+            mode_stats[pos["mode"]].append(pnl)
 
-        send(f"❌ EXIT {sym} %{round(pnl*100,2)}")
-        del positions[sym]
+            send(f"❌ EXIT {sym} %{round(pnl*100,2)}")
+            del positions[sym]
 
 # ========= REPORT =========
 def send_daily_report():
@@ -290,7 +279,6 @@ def send_daily_report():
 
     best_hour = max(hour_stats, key=hour_stats.get) if hour_stats else "N/A"
 
-    # MODE ANALYSIS
     mode_text = ""
     for m, data in mode_stats.items():
         if data:
@@ -298,7 +286,6 @@ def send_daily_report():
             avg = sum(data)/len(data)*100
             mode_text += f"{m} → Winrate: %{round(wr,1)} | PnL: %{round(avg,2)}\n"
 
-    # OPEN POSITIONS
     open_text = ""
     if positions:
         open_text += f"\n📊 AÇIK POZİSYONLAR ({len(positions)})\n"
