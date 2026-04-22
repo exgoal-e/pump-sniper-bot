@@ -8,7 +8,7 @@ CONFIG = {
     "RISK": 0.01,
     "RR": 2,
     "trail": 0.01,
-    "vol_mult": 2,
+    "vol_mult": 2.2,
     "max_open_trades": 5,
     "debug": True,
     "range_mode": True
@@ -114,7 +114,7 @@ def analyze(sym):
     recent_high = df["h"].rolling(20).max().iloc[-2]
     recent_low = df["l"].rolling(20).min().iloc[-2]
 
-    breakout = price > recent_high * 0.995  # erken giriş
+    breakout = price > recent_high * 1.002  # erken giriş
 
     body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
     rng = df["h"].iloc[-1] - df["l"].iloc[-1]
