@@ -11,7 +11,7 @@ CONFIG = {
     "vol_mult": 2.2,
     "max_open_trades": 5,
     "debug": True,
-    "range_mode": True
+    "range_mode": False
 }
 
 TOKEN = os.getenv("TOKEN")
