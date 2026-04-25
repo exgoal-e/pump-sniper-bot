@@ -223,6 +223,7 @@ def manage(sym):
     global daily_pnl, coin_stats, pattern_stats, mode_stats
 
     pos = positions[sym]
+
     df = klines(sym, "5m")
     if df is None:
         return
@@ -231,29 +232,58 @@ def manage(sym):
 
     pnl = (price - pos["entry"]) / pos["entry"] if pos["side"]=="LONG" else (pos["entry"] - price) / pos["entry"]
 
+    # ========= TP1 =========
     if not pos["tp1_hit"]:
         if (pos["side"]=="LONG" and price >= pos["tp1"]) or (pos["side"]=="SHORT" and price <= pos["tp1"]):
-            pos["tp1_hit"] = True
-            send(f"💰 TP1 {sym}")
 
+            pos["tp1_hit"] = True
+
+            # SL -> ENTRY
+            pos["sl"] = pos["entry"]
+
+            send(f"💰 TP1 {sym} → SL moved to ENTRY")
+
+    # ========= TP2 =========
     if not pos["tp2_hit"]:
         if (pos["side"]=="LONG" and price >= pos["tp2"]) or (pos["side"]=="SHORT" and price <= pos["tp2"]):
-            pos["tp2_hit"] = True
-            send(f"💰 TP2 {sym}")
 
-    # TRAILING SADECE TP2 SONRASI
+            pos["tp2_hit"] = True
+
+            # SL -> TP1
+            pos["sl"] = pos["tp1"]
+
+            send(f"💰 TP2 {sym} → SL moved to TP1")
+
+    # ========= STOP LOSS =========
+    if (pos["side"]=="LONG" and price <= pos["sl"]) or (pos["side"]=="SHORT" and price >= pos["sl"]):
+
+        daily_pnl += pnl
+
+        coin_stats.setdefault(sym, []).append(pnl)
+        pattern_stats[pos["side"]].append(pnl)
+        mode_stats[pos["mode"]].append(pnl)
+
+        send(f"🛑 SL HIT {sym} | PnL %{round(pnl*100,2)}")
+
+        del positions[sym]
+        return
+
+    # ========= TRAILING =========
     if pos["tp2_hit"]:
+
         if price > pos["peak"]:
             pos["peak"] = price
 
         if price < pos["peak"] * (1 - CONFIG["trail"]):
+
             daily_pnl += pnl
 
             coin_stats.setdefault(sym, []).append(pnl)
             pattern_stats[pos["side"]].append(pnl)
             mode_stats[pos["mode"]].append(pnl)
 
-            send(f"❌ EXIT {sym} %{round(pnl*100,2)}")
+            send(f"❌ TRAILING EXIT {sym} %{round(pnl*100,2)}")
+
             del positions[sym]
 
 # ========= REPORT =========
