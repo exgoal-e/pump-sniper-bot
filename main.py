@@ -2,6 +2,7 @@ from binance.client import Client
 import pandas as pd
 import time, os, requests
 from datetime import datetime, UTC
+import time, os, requests
 
 # ========= CONFIG =========
 CONFIG = {
@@ -22,6 +23,9 @@ API_SECRET = os.getenv("BINANCE_SECRET")
 client = Client(API_KEY, API_SECRET)
 
 positions = {}
+
+POSITIONS_FILE = "positions.json"
+STATS_FILE = "stats.json"
 
 # ========= STATS =========
 scan_count = 0
@@ -53,6 +57,67 @@ def send(msg):
     except:
         pass
 
+# ========= SAVE / LOAD =========
+def save_positions():
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f)
+    except:
+        pass
+
+def load_positions():
+    global positions
+
+    try:
+        with open(POSITIONS_FILE, "r") as f:
+            positions = json.load(f)
+    except:
+        positions = {}
+
+def save_stats():
+    data = {
+        "scan_count": scan_count,
+        "signal_count": signal_count,
+        "trade_count": trade_count,
+        "daily_pnl": daily_pnl,
+        "coin_stats": coin_stats,
+        "pattern_stats": pattern_stats,
+        "hour_stats": hour_stats,
+        "mode_stats": mode_stats,
+        "last_report_day": last_report_day
+    }
+
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(data, f)
+    except:
+        pass
+
+def load_stats():
+    global scan_count, signal_count, trade_count
+    global daily_pnl, coin_stats
+    global pattern_stats, hour_stats
+    global mode_stats, last_report_day
+
+    try:
+        with open(STATS_FILE, "r") as f:
+            data = json.load(f)
+
+            scan_count = data.get("scan_count", 0)
+            signal_count = data.get("signal_count", 0)
+            trade_count = data.get("trade_count", 0)
+            daily_pnl = data.get("daily_pnl", 0)
+
+            coin_stats = data.get("coin_stats", {})
+            pattern_stats = data.get("pattern_stats", {"LONG": [], "SHORT": []})
+            hour_stats = data.get("hour_stats", {})
+            mode_stats = data.get("mode_stats", {"TREND": [], "RANGE": []})
+
+            last_report_day = data.get("last_report_day", None)
+
+    except:
+        pass
+        
 # ========= INDICATORS =========
 def macd(df):
     ema12 = df["c"].ewm(span=12).mean()
@@ -242,6 +307,7 @@ def manage(sym):
             pos["sl"] = pos["entry"]
 
             send(f"💰 TP1 {sym} → SL moved to ENTRY")
+            save_positions()
 
     # ========= TP2 =========
     if not pos["tp2_hit"]:
@@ -253,6 +319,7 @@ def manage(sym):
             pos["sl"] = pos["tp1"]
 
             send(f"💰 TP2 {sym} → SL moved to TP1")
+            save_positions()
 
     # ========= STOP LOSS =========
     if (pos["side"]=="LONG" and price <= pos["sl"]) or (pos["side"]=="SHORT" and price >= pos["sl"]):
@@ -266,6 +333,8 @@ def manage(sym):
         send(f"🛑 SL HIT {sym} | PnL %{round(pnl*100,2)}")
 
         del positions[sym]
+        save_positions()
+        save_stats()
         return
 
     # ========= TRAILING =========
@@ -285,6 +354,8 @@ def manage(sym):
             send(f"❌ TRAILING EXIT {sym} %{round(pnl*100,2)}")
 
             del positions[sym]
+            save_positions()
+            save_stats()
 
 # ========= REPORT =========
 def send_daily_report():
@@ -334,10 +405,17 @@ def send_daily_report():
                 open_text += f"{sym} → %{round(pnl*100,2)} {tp_status}\n"
             except:
                 continue
+                except:
+            continue
+
+    save_positions()
+    save_stats()
     else:
         open_text = "\n📊 Açık pozisyon yok"
 
     send(f"""
+    save_positions()
+    save_stats()
 📊 GÜNLÜK RAPOR
 
 Tarandı: {scan_count}
@@ -380,6 +458,9 @@ def run():
 
         except:
             continue
+
+load_positions()
+load_stats()
 
 while True:
     run()
