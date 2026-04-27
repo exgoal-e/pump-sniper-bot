@@ -406,8 +406,6 @@ def send_daily_report():
             except:
                 continue
     
-    save_positions()
-    save_stats()
     else:
         open_text = "\n📊 Açık pozisyon yok"
 
@@ -456,7 +454,10 @@ def run():
 
         except:
             continue
-
+            
+save_positions()
+save_stats()
+    
 load_positions()
 load_stats()
 
