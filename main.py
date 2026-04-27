@@ -405,9 +405,7 @@ def send_daily_report():
                 open_text += f"{sym} → %{round(pnl*100,2)} {tp_status}\n"
             except:
                 continue
-                except:
-            continue
-
+    
     save_positions()
     save_stats()
     else:
