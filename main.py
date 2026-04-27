@@ -414,8 +414,8 @@ def send_daily_report():
         open_text = "\n📊 Açık pozisyon yok"
 
     send(f"""
-    save_positions()
-    save_stats()
+save_positions()
+save_stats()
 📊 GÜNLÜK RAPOR
 
 Tarandı: {scan_count}
