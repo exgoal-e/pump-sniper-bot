@@ -13,6 +13,9 @@ CONFIG = {
     "max_open_trades": 5,
     "debug": True,
     "range_mode": False,
+
+    "max_profit": 0.05,
+    "max_loss": 0.03,
 }
 
 TOKEN = os.getenv("TOKEN")
@@ -296,6 +299,41 @@ def manage(sym):
     price = df["c"].iloc[-1]
 
     pnl = (price - pos["entry"]) / pos["entry"] if pos["side"]=="LONG" else (pos["entry"] - price) / pos["entry"]
+    # ========= HARD STOP =========
+    if pnl <= -CONFIG["max_loss"]:
+
+        daily_pnl += pnl
+
+        coin_stats.setdefault(sym, []).append(pnl)
+        pattern_stats[pos["side"]].append(pnl)
+        mode_stats[pos["mode"]].append(pnl)
+
+        send(f"🚨 HARD STOP {sym} %{round(pnl*100,2)}")
+
+        del positions[sym]
+
+        save_positions()
+        save_stats()
+
+        return
+
+    # ========= MAX PROFIT EXIT =========
+    if pnl >= CONFIG["max_profit"]:
+
+        daily_pnl += pnl
+
+        coin_stats.setdefault(sym, []).append(pnl)
+        pattern_stats[pos["side"]].append(pnl)
+        mode_stats[pos["mode"]].append(pnl)
+
+        send(f"🏆 MAX PROFIT EXIT {sym} %{round(pnl*100,2)}")
+
+        del positions[sym]
+
+        save_positions()
+        save_stats()
+
+        return
 
     # ========= TP1 =========
     if not pos["tp1_hit"]:
