@@ -264,6 +264,7 @@ def open_trade(sym, side, df, mode):
         "tp2_hit": False,
         "peak": price,
         "mode": mode
+        "realized": 0,
     }
 
     trade_count += 1
@@ -302,13 +303,15 @@ def manage(sym):
     # ========= HARD STOP =========
     if pnl <= -CONFIG["max_loss"]:
 
-        daily_pnl += pnl
+        final_pnl = pnl - pos["realized"]
 
-        coin_stats.setdefault(sym, []).append(pnl)
-        pattern_stats[pos["side"]].append(pnl)
-        mode_stats[pos["mode"]].append(pnl)
+        daily_pnl += final_pnl
 
-        send(f"🚨 HARD STOP {sym} %{round(pnl*100,2)}")
+        coin_stats.setdefault(sym, []).append(final_pnl)
+        pattern_stats[pos["side"]].append(final_pnl)
+        mode_stats[pos["mode"]].append(final_pnl)
+
+        send(f"🚨 HARD STOP {sym} %{round(final_pnl*100,2)}")
 
         del positions[sym]
 
@@ -320,13 +323,15 @@ def manage(sym):
     # ========= MAX PROFIT EXIT =========
     if pnl >= CONFIG["max_profit"]:
 
-        daily_pnl += pnl
+        final_pnl = pnl - pos["realized"]
 
-        coin_stats.setdefault(sym, []).append(pnl)
-        pattern_stats[pos["side"]].append(pnl)
-        mode_stats[pos["mode"]].append(pnl)
+        daily_pnl += final_pnl
 
-        send(f"🏆 MAX PROFIT EXIT {sym} %{round(pnl*100,2)}")
+        coin_stats.setdefault(sym, []).append(final_pnl)
+        pattern_stats[pos["side"]].append(final_pnl)
+        mode_stats[pos["mode"]].append(final_pnl)
+
+        send(f"🏆 MAX PROFIT EXIT {sym} %{round(final_pnl*100,2)}")
 
         del positions[sym]
 
@@ -344,8 +349,20 @@ def manage(sym):
             # SL -> ENTRY
             pos["sl"] = pos["entry"]
 
-            send(f"💰 TP1 {sym} → SL moved to ENTRY")
+            # PARTIAL REALIZED PNL
+            realized = 0.005
+
+            daily_pnl += realized
+            pos["realized"] += realized
+
+            coin_stats.setdefault(sym, []).append(realized)
+            pattern_stats[pos["side"]].append(realized)
+            mode_stats[pos["mode"]].append(realized)
+
+            send(f"💰 TP1 {sym} (+0.5%) → SL moved to ENTRY")
+
             save_positions()
+            save_stats()
 
     # ========= TP2 =========
     if not pos["tp2_hit"]:
@@ -356,23 +373,39 @@ def manage(sym):
             # SL -> TP1
             pos["sl"] = pos["tp1"]
 
-            send(f"💰 TP2 {sym} → SL moved to TP1")
+            # PARTIAL REALIZED PNL
+            realized = 0.008
+
+            daily_pnl += realized
+            pos["realized"] += realized
+
+            coin_stats.setdefault(sym, []).append(realized)
+            pattern_stats[pos["side"]].append(realized)
+            mode_stats[pos["mode"]].append(realized)
+
+            send(f"💰 TP2 {sym} (+0.8%) → SL moved to TP1")
+
             save_positions()
+            save_stats()
 
     # ========= STOP LOSS =========
     if (pos["side"]=="LONG" and price <= pos["sl"]) or (pos["side"]=="SHORT" and price >= pos["sl"]):
 
-        daily_pnl += pnl
+        final_pnl = pnl - pos["realized"]
 
-        coin_stats.setdefault(sym, []).append(pnl)
-        pattern_stats[pos["side"]].append(pnl)
-        mode_stats[pos["mode"]].append(pnl)
+        daily_pnl += final_pnl
 
-        send(f"🛑 SL HIT {sym} | PnL %{round(pnl*100,2)}")
+        coin_stats.setdefault(sym, []).append(final_pnl)
+        pattern_stats[pos["side"]].append(final_pnl)
+        mode_stats[pos["mode"]].append(final_pnl)
+
+        send(f"🛑 SL HIT {sym} | PnL %{round(final_pnl*100,2)}")
 
         del positions[sym]
+
         save_positions()
         save_stats()
+
         return
 
     # ========= TRAILING =========
@@ -383,15 +416,18 @@ def manage(sym):
 
         if price < pos["peak"] * (1 - CONFIG["trail"]):
 
-            daily_pnl += pnl
+            final_pnl = pnl - pos["realized"]
 
-            coin_stats.setdefault(sym, []).append(pnl)
-            pattern_stats[pos["side"]].append(pnl)
-            mode_stats[pos["mode"]].append(pnl)
+            daily_pnl += final_pnl
 
-            send(f"❌ TRAILING EXIT {sym} %{round(pnl*100,2)}")
+            coin_stats.setdefault(sym, []).append(final_pnl)
+            pattern_stats[pos["side"]].append(final_pnl)
+            mode_stats[pos["mode"]].append(final_pnl)
+
+            send(f"❌ TRAILING EXIT {sym} %{round(final_pnl*100,2)}")
 
             del positions[sym]
+
             save_positions()
             save_stats()
 
@@ -448,8 +484,7 @@ def send_daily_report():
         open_text = "\n📊 Açık pozisyon yok"
 
     send(f"""
-save_positions()
-save_stats()
+
 📊 GÜNLÜK RAPOR
 
 Tarandı: {scan_count}
