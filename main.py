@@ -263,7 +263,7 @@ def open_trade(sym, side, df, mode):
         "tp1_hit": False,
         "tp2_hit": False,
         "peak": price,
-        "mode": mode
+        "mode": mode,
         "realized": 0,
     }
 
