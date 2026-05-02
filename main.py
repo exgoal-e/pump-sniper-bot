@@ -509,21 +509,36 @@ PnL: %{round(daily_pnl*100,2)}
 def run():
     global scan_count
 
-    for sym in symbols()[:100]:
+    syms = symbols()[:100]
+
+    # ========= ANALYZE =========
+    for sym in syms:
+
         scan_count += 1
 
         try:
+
+            # açık pozisyon varsa tekrar entry arama
+            if sym in positions:
+                continue
+
             res = analyze(sym)
+
             if not res:
                 continue
 
             side, df, mode = res
 
-            if sym not in positions:
-                open_trade(sym, side, df, mode)
+            open_trade(sym, side, df, mode)
 
-            if sym in positions:
-                manage(sym)
+        except:
+            continue
+
+    # ========= MANAGE =========
+    for sym in list(positions.keys()):
+
+        try:
+            manage(sym)
 
         except:
             continue
