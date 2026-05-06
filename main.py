@@ -182,14 +182,16 @@ def analyze(sym):
     recent_high = df["h"].rolling(20).max().iloc[-2]
     recent_low = df["l"].rolling(20).min().iloc[-2]
 
-    breakout = price > recent_high * 1.002  # erken giriş
+    # 🔥 DAHA SIKI BREAKOUT
+    breakout = price > recent_high * 1.004
 
     body = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
     rng = df["h"].iloc[-1] - df["l"].iloc[-1]
     if rng == 0:
         return None
 
-    strong = body > rng * 0.5
+    # 🔥 DAHA GÜÇLÜ MOMENTUM ŞARTI
+    strong = body > rng * 0.6
 
     # DEBUG
     if CONFIG["debug"]:
@@ -209,31 +211,6 @@ def analyze(sym):
     if macd_cross and volSpike and breakout and price > ma:
         signal_count += 1
         return "LONG", df, "TREND"
-
-    # RANGE
-    if CONFIG["range_mode"]:
-
-        # trend varsa range yok
-        if price > ma:
-            return None
-
-        r = rsi(df)
-        if r is None or len(r) < 2:
-            return None
-
-        near_low = price <= recent_low * 1.01
-        near_high = price >= recent_high * 0.99
-
-        bullish = df["c"].iloc[-1] > df["o"].iloc[-1] and df["c"].iloc[-2] > df["o"].iloc[-2]
-        bearish = df["c"].iloc[-1] < df["o"].iloc[-1] and df["c"].iloc[-2] < df["o"].iloc[-2]
-
-        if near_low and r.iloc[-1] < 30 and bullish:
-            signal_count += 1
-            return "LONG", df, "RANGE"
-
-        if near_high and r.iloc[-1] > 70 and bearish:
-            signal_count += 1
-            return "SHORT", df, "RANGE"
 
     return None
 
